@@ -1,0 +1,312 @@
+--corrected as first query
+-- with category
+-- with no results
+
+WITH
+ga_tables AS (
+     (
+    SELECT
+      *,
+      'KE' AS country,
+      'web' as platform
+    FROM
+      `thermal-setup-558.69012576.ga_sessions_*`
+    WHERE
+      _TABLE_SUFFIX >= "20210614"
+      AND _TABLE_SUFFIX <= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)) )
+
+   UNION ALL
+
+  (
+    SELECT
+      *,
+      'KE' AS country,
+      'app' as platform
+    FROM
+      `thermal-setup-558.73548802.ga_sessions_*`
+    WHERE
+      _TABLE_SUFFIX >= "20210614"
+      AND _TABLE_SUFFIX <= FORMAT_DATE('%Y%m%d', DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)) )
+ 
+),
+
+ga_raw AS (
+      SELECT
+          --session
+          country,
+          PARSE_DATE("%Y%m%d", date) AS date,
+          fullVisitorId,
+          visitId,
+          platform,
+          hits.appInfo.screenName,
+
+          --hits
+          hits.type,
+          hits.transaction.transactionId,
+          hits.time,
+
+          hits.hitNumber,
+          hp.productSku AS sku,
+          hp.isImpression,
+          hits.page.pagePath AS path,
+          REGEXP_EXTRACT(hits.page.pagePath, r'(.*?)(?:&|$)') as norm_path,     -- path = /catalog/?q=Micro+sdhc+card+reader&page=2 returns /catalog/?q=Micro+sdhc+card+reader
+          --hits.eventInfo.eventCategory as eventCategory,
+          --hits.eventInfo.eventAction,
+          hits.page.searchKeyword,
+          hits.eCommerceAction.action_type,
+          productListName,
+          productListPosition,
+
+
+          -- aggregation for interactions
+          max(IF(isImpression = True AND type = 'EVENT' AND hits.eCommerceAction.action_type = '0',1,0)) AS impression,
+          max(IF((cast(isImpression as BOOL) IS NULL OR cast(isImpression as BOOL) = FALSE ) AND type = 'EVENT' AND hits.eCommerceAction.action_type = '1', 1, 0)) AS  click,
+          max(IF(hits.eCommerceAction.action_type = '3', 1 , 0)) as add_to_cart,
+          max(IF(hits.eCommerceAction.action_type = '6', 1 , 0)) as transaction,
+          max(CASE
+            WHEN (platform = 'web' and (hcd.index = 21 or  hcd.index = 32)) AND hcd.value = 'searchNoResults' THEN TRUE
+            WHEN (platform = 'app' and (hcd.index = 8 or  hcd.index = 9)) AND hcd.value = 'searchNoResults' THEN TRUE
+            ELSE NULL END )
+          as is_no_result,
+
+        FROM
+           ga_tables as ga
+        LEFT JOIN
+          UNNEST(ga.hits) hits
+        LEFT JOIN
+          UNNEST(hits.product) hp
+        LEFT JOIN
+          UNNEST(ga.customDimensions) cd
+        LEFT JOIN
+          UNNEST(hits.customDimensions) hcd
+
+        GROUP BY
+        -- session
+          country,
+          date,
+          fullVisitorId,
+          visitId,
+          platform,
+          screenName,
+        -- hits
+          type,
+          transactionId,
+          hitNumber,
+          path,
+          norm_path,
+          --eventCategory,
+          --eventAction,
+          searchKeyword,    -- for web only
+          time,
+          --hits.hour,
+          --hits.minute,
+          action_type,
+          productSku,
+          isImpression,
+          productListName,
+          productListPosition
+),
+
+search AS (
+  select
+    date,
+    country,
+    fullVisitorId,
+    visitId,
+    platform,
+    case when platform = 'web' then norm_path else screenName end as path,
+    case when platform = 'web' then searchKeyword else (if(productListName = 'catalog_searchResults' and screenName != 'catalog_searchResults', screenName, null)) end as searchKeyWord,
+    is_no_result
+   FROM
+    ga_raw
+   WHERE
+    case when platform = 'web'
+      then searchKeyword
+      else (if(productListName = 'catalog_searchResults' and screenName != 'catalog_searchResults', screenName, null))
+    end is not null
+   GROUP BY
+    date,
+    country,
+    fullVisitorId,
+    visitId,
+    platform,
+    path,
+    searchKeyWord,
+    is_no_result
+),
+
+ad as (
+  select country, fullVisitorId, visitId, platform, sku, count(sku) as add_to_carts
+  from ga_raw
+  where add_to_cart > 0
+  group by country, fullVisitorId, visitId, platform, sku
+ ),
+
+transaction as (
+  select country, fullVisitorId, visitId, platform, sku, count(sku) as transactions
+  from ga_raw
+  where transaction  > 0
+  group by country, fullVisitorId, visitId, platform, sku
+ ),
+
+impressions_clicks as (
+
+  SELECT
+    ga.country,
+    ga.date,
+    ga.fullVisitorId,
+    ga.visitId,
+    ga.platform,
+    hitNumber,	-- will consider different impression if user goes to PDP and hits back button
+    sku,
+    productListName,
+    productListPosition,
+    s.searchKeyword,
+    ga.norm_path,
+    ga.is_no_result,
+    sum(case when productListName = 'catalog_searchResults' then impression else 0 end) as impressions,
+    sum(case when productListName = 'catalog_searchResults' then click else 0 end) as clicks
+  FROM
+    ga_raw ga
+    LEFT JOIN search s
+	ON  s.country = ga.country
+		AND s.fullVisitorId = ga.fullVisitorId
+		AND s.visitId = ga.visitId
+        AND s.platform = ga.platform
+        AND s.date = ga.date
+		AND (
+            (ga.platform = 'web' and s.path = ga.norm_path)
+            or (ga.platform = 'app' and s.searchKeyWord = ga.screenName)
+        )
+  GROUP BY
+    ga.country,
+    hitNumber,
+    date,
+    ga.fullVisitorId,
+    ga.visitId,
+    platform,
+    sku,
+    productListName,
+    productListPosition,
+    searchKeyword,
+    ga.norm_path,
+    ga.is_no_result
+ ),
+
+ all_kpis as (
+
+ SELECT
+    country,
+    date,
+    fullVisitorId,
+    visitId,
+    platform,
+    searchKeyword,
+    is_no_result,
+    sum(impressions_) as impressions,
+    sum(clicks_) as clicks,
+    sum(add_to_carts) as add_to_carts,
+    sum(transactions) as transactions,
+    if(sum(clicks_) > 0 or sum(add_to_carts) > 0 or sum(transactions) > 0, concat(fullVisitorId, visitId), null) as searches_with_interactions
+
+    FROM (
+       SELECT
+          i.country,
+          i.date,
+          i.fullVisitorId,
+          i.visitId,
+          i.platform,
+          i.sku,
+          i.searchKeyword,
+          i.is_no_result,
+          SUM(impressions) as impressions_,
+          SUM(clicks) as clicks_,
+          IF(a.sku is not null, a.add_to_carts , 0) as add_to_carts, -- TODO: count non-binary add to cart
+          IF(t.sku is not null, t.transactions , 0) as transactions -- TODO: count non-binary transactions
+
+       FROM
+        impressions_clicks i
+        left join ad a
+          on a.country = i.country
+          and a.fullVisitorId = i.fullVisitorId
+          and a.visitId = i.visitId
+          and a.sku = i.sku
+          and a.platform = i.platform
+          and i.productListName = 'catalog_searchResults'
+        left join transaction t
+          on t.country = i.country
+          and t.fullVisitorId =  i.fullVisitorId
+          and t.visitId = i.visitId
+          and t.sku = i.sku
+          and a.platform = i.platform
+          and i.productListName = 'catalog_searchResults'
+        where i.searchKeyword is not null
+        GROUP BY
+          country,
+          date,
+          fullVisitorId,
+          visitId,
+          platform,
+          sku,
+          a.sku,
+          a.add_to_carts,
+          t.sku,
+          t.transactions,
+          searchKeyword,
+          is_no_result
+          )
+    GROUP BY
+      country,
+      date,
+      fullVisitorId,
+      visitId,
+      platform,
+      searchKeyword,
+      is_no_result
+ )
+
+select
+  extract(year from date) as year,
+  extract(isoweek from date) as ww,
+  country,
+  date,
+  searchKeyWord,
+  sum(searches_) as searches,
+  sum(searches_no_results_) as searches_no_results,
+  sum(impressions_) as impressions,
+  sum(clicks_) as clicks,
+  sum(add_to_carts_) as add_to_carts,
+  sum(transactions_) as transactions,
+  sum(searches_with_interactions_) as searches_with_interactions,
+  round((sum(transactions_)/sum(searches_)), 4) as cvr
+
+  from (
+   select
+    distinct
+    date,
+    a.country,
+    platform,
+    a.searchKeyword,
+    c.category,
+    count(distinct case when is_no_result then concat(fullVisitorId, visitId, a.searchKeyWord) else null end)
+      over(partition by date, a.country, platform, a.searchKeyWord) as searches_no_results_,
+    count(distinct concat(fullVisitorId, visitId)) over(partition by date, a.country, platform, a.searchKeyWord) as searches_,
+    sum(impressions) over(partition by date, a.country, platform, a.searchKeyWord) as impressions_,
+    sum(clicks) over(partition by date, a.country, platform, a.searchKeyWord) as clicks_,
+    sum(add_to_carts) over(partition by date, a.country, platform, a.searchKeyWord)  as add_to_carts_,
+    sum(transactions) over(partition by date, a.country, platform, a.searchKeyWord) as transactions_,
+    count(distinct searches_with_interactions) over(partition by date, a.country, platform, a.searchKeyWord) as searches_with_interactions_
+  from
+    all_kpis a
+    left join `machine-learning-158615.search_and_sorting.pbi_search_routine_term_category` c
+    on lower(a.country) = lower(c.country)
+    and a.searchKeyWord = c.searchKeyWord
+  )
+  group by
+    year,
+    ww,
+    country,
+    date,
+    searchKeyWord
+    having sum(searches_) > 10
+    order by sum(transactions_) desc
